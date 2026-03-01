@@ -1,10 +1,11 @@
 import asyncio
+import csv
 import json
 import logging
-import sqlite3
 import time
 import os
 import subprocess
+from datetime import datetime, timezone, timedelta
 from tapo import ApiClient
 from wakeonlan import send_magic_packet
 from dotenv import load_dotenv
@@ -42,44 +43,40 @@ CHARGE_AMPS = float(os.getenv("CHARGE_AMPS"))
 AVG_LOAD_WATTS = float(os.getenv("AVG_LOAD_WATTS"))
 MAX_OUTAGE_MINUTES = int(os.getenv("MAX_OUTAGE_MINUTES"))
 
-# File Paths
-DB_PATH = "./watchtower.db"
-STATE_FILE = "./state.json"
-
 # Derived BMS Constants
 TOTAL_CAPACITY_WH = BATTERY_VOLTAGE * BATTERY_AH
 USABLE_CAPACITY_WH = TOTAL_CAPACITY_WH * 0.80  # Keep 20% safe buffer
 DISCHARGE_WH_PER_MIN = AVG_LOAD_WATTS / 60
 CHARGE_WH_PER_MIN = (BATTERY_VOLTAGE * CHARGE_AMPS * 0.80) / 60 # 80% charging efficiency
 
-# ==========================================
-# 🗄️ DATABASE & STATE MANAGEMENT
-# ==========================================
-def init_db():
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute('''CREATE TABLE IF NOT EXISTS grid_telemetry
-                 (timestamp DATETIME DEFAULT CURRENT_TIMESTAMP, voltage REAL, is_power_on BOOLEAN, battery_percent REAL)''')
-    c.execute('''CREATE TABLE IF NOT EXISTS watchtower_events
-                 (timestamp DATETIME DEFAULT CURRENT_TIMESTAMP, event_type TEXT, details TEXT)''')
-    conn.commit()
-    conn.close()
+STATE_FILE = "./state.json"
+EVENT_LOG = "./events.csv"
+TAPO_TIMEOUT = 15  # seconds — fail fast if plug unreachable
 
-def log_telemetry(voltage, is_power_on, battery_percent):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("INSERT INTO grid_telemetry (voltage, is_power_on, battery_percent) VALUES (?, ?, ?)", 
-              (voltage, is_power_on, round(battery_percent, 2)))
-    conn.commit()
-    conn.close()
+# IST timezone (UTC+5:30)
+IST = timezone(timedelta(hours=5, minutes=30))
 
-def log_event(event_type, details=""):
-    log.info(f"{event_type} - {details}")
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("INSERT INTO watchtower_events (event_type, details) VALUES (?, ?)", (event_type, details))
-    conn.commit()
-    conn.close()
+# ==========================================
+# 💾 STATE & EVENT MANAGEMENT
+# ==========================================
+def now_ist():
+    """Current time in IST as a formatted string."""
+    return datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S")
+
+def log_csv_event(event, duration_mins=None, battery_pct=None, details=""):
+    """Append an event row to the CSV log."""
+    file_exists = os.path.exists(EVENT_LOG)
+    with open(EVENT_LOG, 'a', newline='') as f:
+        writer = csv.writer(f)
+        if not file_exists:
+            writer.writerow(["timestamp", "event", "duration_mins", "battery_pct", "details"])
+        writer.writerow([
+            now_ist(),
+            event,
+            round(duration_mins, 1) if duration_mins is not None else "",
+            round(battery_pct, 1) if battery_pct is not None else "",
+            details
+        ])
 
 def load_state():
     if not os.path.exists(STATE_FILE):
@@ -98,8 +95,6 @@ def save_state(state):
 # ==========================================
 # 🧠 THE WATCHTOWER LOGIC LOOP
 # ==========================================
-TAPO_TIMEOUT = 15  # seconds — fail fast if plug unreachable
-
 async def main():
     log.info("Starting PowerSentry Watchtower...")
     log.info(f"Tapo plug IP: {TAPO_IP}")
@@ -107,99 +102,72 @@ async def main():
     log.info(f"Battery model: {TOTAL_CAPACITY_WH:.0f}Wh total, {USABLE_CAPACITY_WH:.0f}Wh usable")
     log.info(f"Max outage before shutdown: {MAX_OUTAGE_MINUTES} mins")
 
-    log.info("Initializing database...")
-    init_db()
-    log.info("Database ready.")
-
     state = load_state()
     log.info(f"State loaded: battery={state['current_wh']:.1f}Wh, pc_shut_down={state['pc_is_shut_down']}")
 
-    log.info("Creating Tapo API client...")
     client = ApiClient(TAPO_EMAIL, TAPO_PASS, timeout_s=TAPO_TIMEOUT)
     log.info("Tapo client created. Entering main loop.")
 
     while True:
         try:
             # Try to contact the Smart Plug (timeout handled by ApiClient)
-            log.info(f"Polling Tapo plug at {TAPO_IP}...")
             device = await client.p110(TAPO_IP)
             device_info = await device.get_device_info()
-            energy_usage = await device.get_energy_usage()
-
-            # current_power is in milliwatts, may be None on some models
-            current_power_mw = getattr(energy_usage, 'current_power', None)
-            current_watts = (current_power_mw / 1000) if current_power_mw is not None else 0.0
             uptime = device_info.on_time
-            log.info(f"Plug OK — power={current_watts:.1f}W, uptime={uptime}s")
-            
-            # 1. POWER IS ON (Grid Restored / Charging)
-            if state["power_cut_time"] is not None:
-                # Power just came back!
-                cut_duration = int(time.time() - state["power_cut_time"]) / 60
-                
-                # Check for Wi-Fi Blip False Positive
-                if uptime < 300: # Plug rebooted recently, so it was a real power cut
-                    log_event("POWER RESTORED", f"Duration: {round(cut_duration)} mins")
-                    
-                    # Do we need to wake the PC?
-                    if state["pc_is_shut_down"]:
-                        send_magic_packet(PC_MAC)
-                        log_event("WOL PACKET SENT", f"Waking 3090 Rig ({PC_MAC})")
-                        state["pc_is_shut_down"] = False
-                else:
-                    log_event("WIFI BLIP DETECTED", "Plug never lost power. Ignoring.")
-                
-                state["power_cut_time"] = None
-            
+
             # Charge the Virtual Battery
             state["current_wh"] = min(state["current_wh"] + CHARGE_WH_PER_MIN, USABLE_CAPACITY_WH)
             battery_pct = (state["current_wh"] / USABLE_CAPACITY_WH) * 100
-            
-            log_telemetry(current_watts, True, battery_pct)
-            save_state(state)
 
-        except asyncio.TimeoutError:
-            log.warning(f"Tapo plug at {TAPO_IP} unreachable (timeout after {TAPO_TIMEOUT}s)")
-            # 2. POWER IS OUT (Connection Timeout)
-            if state["power_cut_time"] is None:
-                state["power_cut_time"] = time.time()
-                log_event("POWER CUT DETECTED", "Grid failure.")
-            
-            outage_duration_mins = (time.time() - state["power_cut_time"]) / 60
-            
-            # Drain the Virtual Battery
-            state["current_wh"] = max(state["current_wh"] - DISCHARGE_WH_PER_MIN, 0)
-            battery_pct = (state["current_wh"] / USABLE_CAPACITY_WH) * 100
-            
-            log_telemetry(0.0, False, battery_pct)
-            
-            # 3. THE FAILSAFE (Shutdown PC if limit reached)
-            if outage_duration_mins >= MAX_OUTAGE_MINUTES and not state["pc_is_shut_down"]:
-                log_event("SHUTDOWN INITIATED", "4-Hour Limit Reached. Saving 3090 Rig.")
-                
-                # Execute SSH Shutdown (Requires passwordless SSH keys setup)
-                subprocess.run(["ssh", f"{PC_USER}@{PC_IP}", SHUTDOWN_CMD], capture_output=True)
-                
-                state["pc_is_shut_down"] = True
-            
+            log.info(f"Grid OK — battery={battery_pct:.1f}%, uptime={uptime}s")
+
+            # POWER IS ON (Grid Restored / Charging)
+            if state["power_cut_time"] is not None:
+                cut_duration = int(time.time() - state["power_cut_time"]) / 60
+
+                # Check for Wi-Fi Blip False Positive
+                if uptime < 300: # Plug rebooted recently, so it was a real power cut
+                    log.info(f"POWER RESTORED — outage lasted {round(cut_duration)} mins")
+                    log_csv_event("POWER_RESTORED", duration_mins=cut_duration, battery_pct=battery_pct)
+
+                    # Do we need to wake the PC?
+                    if state["pc_is_shut_down"]:
+                        send_magic_packet(PC_MAC)
+                        log.info(f"WOL PACKET SENT — waking {PC_MAC}")
+                        log_csv_event("WOL_SENT", battery_pct=battery_pct, details=PC_MAC)
+                        state["pc_is_shut_down"] = False
+                else:
+                    log.info("WIFI BLIP DETECTED — plug never lost power, ignoring")
+                    log_csv_event("WIFI_BLIP", duration_mins=cut_duration, battery_pct=battery_pct)
+
+                state["power_cut_time"] = None
+
             save_state(state)
 
         except Exception as e:
-            log.error(f"Unexpected error: {type(e).__name__}: {e}")
-            # Still treat as power out — same drain/shutdown logic
+            # Tapo library wraps all connection failures (timeout, unreachable, etc.)
+            # as generic Exceptions with verbose Rust/reqwest internals — log cleanly
+            log.warning(f"Plug unreachable — {type(e).__name__}")
+
+            # Treat as power out — drain battery, trigger shutdown if needed
             if state["power_cut_time"] is None:
                 state["power_cut_time"] = time.time()
-                log_event("POWER CUT DETECTED", f"Grid failure ({type(e).__name__}).")
+                log.info("POWER CUT DETECTED")
+                battery_pct = (state["current_wh"] / USABLE_CAPACITY_WH) * 100
+                log_csv_event("POWER_CUT", battery_pct=battery_pct)
 
             outage_duration_mins = (time.time() - state["power_cut_time"]) / 60
 
+            # Drain the Virtual Battery
             state["current_wh"] = max(state["current_wh"] - DISCHARGE_WH_PER_MIN, 0)
             battery_pct = (state["current_wh"] / USABLE_CAPACITY_WH) * 100
 
-            log_telemetry(0.0, False, battery_pct)
+            log.info(f"Grid DOWN — battery={battery_pct:.1f}%, outage={outage_duration_mins:.1f}min")
 
+            # THE FAILSAFE (Shutdown PC if limit reached)
             if outage_duration_mins >= MAX_OUTAGE_MINUTES and not state["pc_is_shut_down"]:
-                log_event("SHUTDOWN INITIATED", "4-Hour Limit Reached. Saving 3090 Rig.")
+                log.info("SHUTDOWN INITIATED — outage limit reached, saving 3090 Rig")
+                log_csv_event("SHUTDOWN", duration_mins=outage_duration_mins, battery_pct=battery_pct, details="outage limit reached")
                 subprocess.run(["ssh", f"{PC_USER}@{PC_IP}", SHUTDOWN_CMD], capture_output=True)
                 state["pc_is_shut_down"] = True
 
