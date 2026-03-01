@@ -4,6 +4,7 @@ import logging
 import sqlite3
 import time
 import os
+import subprocess
 from tapo import ApiClient
 from wakeonlan import send_magic_packet
 from dotenv import load_dotenv
@@ -114,20 +115,22 @@ async def main():
     log.info(f"State loaded: battery={state['current_wh']:.1f}Wh, pc_shut_down={state['pc_is_shut_down']}")
 
     log.info("Creating Tapo API client...")
-    client = ApiClient(TAPO_EMAIL, TAPO_PASS)
+    client = ApiClient(TAPO_EMAIL, TAPO_PASS, timeout_s=TAPO_TIMEOUT)
     log.info("Tapo client created. Entering main loop.")
 
     while True:
         try:
-            # Try to contact the Smart Plug (with timeout)
-            log.debug(f"Connecting to Tapo plug at {TAPO_IP}...")
-            device = await asyncio.wait_for(client.p110(TAPO_IP), timeout=TAPO_TIMEOUT)
-            device_info = await asyncio.wait_for(device.get_device_info(), timeout=TAPO_TIMEOUT)
-            energy_usage = await asyncio.wait_for(device.get_energy_usage(), timeout=TAPO_TIMEOUT)
-            log.debug("Tapo plug responded OK.")
-            
-            voltage = energy_usage.current_power / 1000 if hasattr(energy_usage, 'current_power') else 230.0 # Adjust based on exact P110 API return
+            # Try to contact the Smart Plug (timeout handled by ApiClient)
+            log.info(f"Polling Tapo plug at {TAPO_IP}...")
+            device = await client.p110(TAPO_IP)
+            device_info = await device.get_device_info()
+            energy_usage = await device.get_energy_usage()
+
+            # current_power is in milliwatts, may be None on some models
+            current_power_mw = getattr(energy_usage, 'current_power', None)
+            current_watts = (current_power_mw / 1000) if current_power_mw is not None else 0.0
             uptime = device_info.on_time
+            log.info(f"Plug OK — power={current_watts:.1f}W, uptime={uptime}s")
             
             # 1. POWER IS ON (Grid Restored / Charging)
             if state["power_cut_time"] is not None:
@@ -152,7 +155,7 @@ async def main():
             state["current_wh"] = min(state["current_wh"] + CHARGE_WH_PER_MIN, USABLE_CAPACITY_WH)
             battery_pct = (state["current_wh"] / USABLE_CAPACITY_WH) * 100
             
-            log_telemetry(voltage, True, battery_pct)
+            log_telemetry(current_watts, True, battery_pct)
             save_state(state)
 
         except asyncio.TimeoutError:
