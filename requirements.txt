@@ -1,0 +1,3 @@
+tapo
+wakeonlan
+python-dotenv
