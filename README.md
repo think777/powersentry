@@ -103,7 +103,7 @@ cp .env.example .env
 | `TAPO_PASS` | Tapo account password | `yourpassword` |
 | `PC_MAC` | Target PC MAC address | `AA:BB:CC:DD:EE:FF` |
 | `PC_IP` | Target PC IP address | `192.168.1.50` |
-| `PC_USER` | SSH username on target PC | `sujan` |
+| `PC_USER` | SSH username on target PC | `user` |
 | `SHUTDOWN_CMD` | Shutdown command to run via SSH | `sudo shutdown -h now` |
 | `BATTERY_VOLTAGE` | Nominal battery bank voltage | `24` |
 | `BATTERY_AH` | Total Ah capacity | `320` |
