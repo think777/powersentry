@@ -21,7 +21,7 @@ SyslogIdentifier=powersentry
 # Hardening
 NoNewPrivileges=true
 ProtectSystem=strict
-ProtectHome=read-only
+# ProtectHome=read-only — removed, conflicts with WorkingDirectory under /home/
 ReadWritePaths=/home/user/powersentry
 PrivateTmp=true
 
