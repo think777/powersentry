@@ -1,14 +1,14 @@
 [Unit]
 Description=PowerSentry — Virtual BMS Watchtower for Inverter + Lead-Acid Battery
-Documentation=https://github.com/yourusername/powersentry
+Documentation=https://github.com/think777/powersentry
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-User=sujan
-WorkingDirectory=/home/sujan/powersentry
-ExecStart=/home/sujan/powersentry/.venv/bin/python powersentry.py
+User=user
+WorkingDirectory=/home/user/powersentry
+ExecStart=/home/user/powersentry/.venv/bin/python powersentry.py
 Restart=on-failure
 RestartSec=30
 WatchdogSec=300
@@ -22,7 +22,7 @@ SyslogIdentifier=powersentry
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=read-only
-ReadWritePaths=/home/sujan/powersentry
+ReadWritePaths=/home/user/powersentry
 PrivateTmp=true
 
 [Install]
