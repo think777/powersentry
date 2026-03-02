@@ -80,7 +80,7 @@ Not every plug-unreachable event is a power cut. If the plug's uptime is >5 minu
 ### Install
 
 ```bash
-git clone https://github.com/yourusername/powersentry.git
+git clone https://github.com/think777/powersentry.git
 cd powersentry
 python3 -m venv .venv
 source .venv/bin/activate
@@ -198,4 +198,4 @@ Runtime:           ~9.4 hrs   (down from 10.4 hrs)
 
 ## License
 
-MIT
+GPL-3.0 — see [LICENSE](LICENSE) for details.
