@@ -11,7 +11,7 @@ WorkingDirectory=/home/user/powersentry
 ExecStart=/home/user/powersentry/.venv/bin/python powersentry.py
 Restart=on-failure
 RestartSec=30
-WatchdogSec=300
+
 
 # Logging — stdout/stderr go to journalctl
 StandardOutput=journal
